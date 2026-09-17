@@ -21,11 +21,13 @@ IFS=$'\n\t'
 #     | sudo bash -s -- netserv-rh /var/www/netserv-rh
 #
 # O script:
-#   - instala dependências de compilação do Ruby/Rails;
-#   - instala uma versão específica do Ruby em /opt/ruby;
+#   - instala as dependências de build das gems nativas;
+#   - instala o Ruby em /opt/ruby, por pacote da distribuição (rápido, sem
+#     compilar) ou a partir do código-fonte quando a versão exata importa;
 #   - instala Bundler;
 #   - opcionalmente instala Node.js/NPM;
-#   - permite instalar PostgreSQL, MySQL/MariaDB compatível, ou nenhum banco;
+#   - permite instalar PostgreSQL (18 pelo repositório oficial PGDG),
+#     MySQL/MariaDB compatível, ou nenhum banco;
 #   - cria banco e credenciais informadas pelo operador;
 #   - cria usuário/grupo de serviço para a aplicação;
 #   - dá acesso colaborativo aos administradores do grupo sudo;
@@ -37,8 +39,17 @@ IFS=$'\n\t'
 #   migrations automaticamente. Ele apenas prepara o ambiente do servidor.
 # ==============================================================================
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.1.0"
 RUBY_VERSION_DEFAULT="3.4.10"
+# Instalar o Ruby pelo pacote da distribuição não compila nada e leva segundos,
+# mas entrega a versão que a distribuição empacota. Compilar leva de 5 a 15
+# minutos e é o único caminho quando a versão exata (patch) importa.
+RUBY_INSTALL_METHOD_DEFAULT="package"
+# O PostgreSQL da distribuição costuma estar uma versão atrás; o repositório
+# oficial do projeto (PGDG) tem a série corrente para Debian/Ubuntu.
+PG_VERSION_DEFAULT="18"
+PGDG_KEYRING="/usr/share/keyrings/postgresql-archive-keyring.gpg"
+PGDG_LIST="/etc/apt/sources.list.d/pgdg.list"
 RAILS_APPS_CONFIG_ROOT="/etc/rails-apps"
 TTY_DEVICE="/dev/tty"
 
@@ -227,6 +238,27 @@ prompt_password() {
   done
 }
 
+# A versão real que a distribuição entrega: ruby-full aponta a série (1:3.3) e
+# o pacote rubyX.Y carrega o patch (3.3.8-2).
+distro_ruby_version() {
+  local candidate series exact
+
+  candidate="$(apt-cache policy ruby-full 2>/dev/null | awk '/Candidate:/ {print $2}')"
+
+  if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    candidate="$(apt-cache policy ruby-full 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  fi
+
+  [[ -n "$candidate" && "$candidate" != "(none)" ]] || return 0
+
+  series="${candidate#*:}"
+  exact="$(apt-cache policy "ruby${series}" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  exact="${exact%%-*}"
+
+  printf '%s' "${exact:-$series}"
+}
+
 collect_options() {
   echo
   echo "=============================================="
@@ -239,7 +271,36 @@ collect_options() {
   echo "Grupo     : $APP_GROUP"
   echo
 
-  prompt_nonempty RUBY_VERSION "Versão do Ruby" "$RUBY_VERSION_DEFAULT"
+  echo "Instalação do Ruby:"
+  echo "  1) Pacote da distribuição — segundos, sem compilar (versão empacotada)"
+  echo "  2) Código-fonte — compila, 5 a 15 minutos (versão exata)"
+  echo
+
+  local default_choice="1"
+  [[ "$RUBY_INSTALL_METHOD_DEFAULT" == "source" ]] && default_choice="2"
+
+  while true; do
+    read -r -p "Escolha [1-2] (padrão: ${default_choice}): " RUBY_METHOD_CHOICE < "$TTY_DEVICE"
+    RUBY_METHOD_CHOICE="${RUBY_METHOD_CHOICE:-$default_choice}"
+    case "$RUBY_METHOD_CHOICE" in
+      1) RUBY_INSTALL_METHOD="package"; break ;;
+      2) RUBY_INSTALL_METHOD="source";  break ;;
+      *) echo "Opção inválida." ;;
+    esac
+  done
+
+  if [[ "$RUBY_INSTALL_METHOD" == "source" ]]; then
+    prompt_nonempty RUBY_VERSION "Versão do Ruby" "$RUBY_VERSION_DEFAULT"
+  else
+    RUBY_VERSION="$(distro_ruby_version)"
+    if [[ -z "$RUBY_VERSION" ]]; then
+      warn "A distribuição não empacota um Ruby utilizável; será necessário compilar."
+      RUBY_INSTALL_METHOD="source"
+      prompt_nonempty RUBY_VERSION "Versão do Ruby" "$RUBY_VERSION_DEFAULT"
+    else
+      log "Ruby da distribuição: ${RUBY_VERSION}"
+    fi
+  fi
 
   INSTALL_NODE="0"
   if prompt_yes_no "Instalar Node.js e NPM do repositório da distribuição?" "S"; then
@@ -263,6 +324,12 @@ collect_options() {
     esac
   done
 
+  PG_VERSION="$PG_VERSION_DEFAULT"
+  PG_PORT="5432"
+  if [[ "$DB_ENGINE" == "postgresql" ]]; then
+    prompt_nonempty PG_VERSION "Versão do PostgreSQL (repositório oficial PGDG)" "$PG_VERSION_DEFAULT"
+  fi
+
   DB_NAME=""
   DB_USER=""
   DB_PASSWORD=""
@@ -279,9 +346,9 @@ collect_options() {
   echo "----------------------------------------------"
   echo "Aplicação       : $APP_NAME"
   echo "Diretório       : $APP_DIR"
-  echo "Ruby            : $RUBY_VERSION"
+  echo "Ruby            : $RUBY_VERSION ($([[ "$RUBY_INSTALL_METHOD" == "package" ]] && echo "pacote, sem compilar" || echo "compilado do fonte"))"
   echo "Node.js/NPM     : $([[ "$INSTALL_NODE" == "1" ]] && echo "sim" || echo "não")"
-  echo "Banco local     : $DB_ENGINE"
+  echo "Banco local     : $DB_ENGINE$([[ "$DB_ENGINE" == "postgresql" ]] && echo " ${PG_VERSION} (PGDG)" || echo "")"
   if [[ "$DB_ENGINE" != "none" ]]; then
     echo "Database        : $DB_NAME"
     echo "Usuário DB      : $DB_USER"
@@ -304,15 +371,15 @@ install_base_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
 
+  # Pacotes necessários em qualquer caso: as gems nativas (pg, nokogiri,
+  # sqlite3, bcrypt) compilam no `bundle install`, mesmo com Ruby de pacote.
   local packages=(
     build-essential
     ca-certificates
     curl
     git
+    gnupg
     pkg-config
-    autoconf
-    bison
-    rustc
     xz-utils
     acl
     openssl
@@ -333,6 +400,11 @@ install_base_packages() {
     libsqlite3-dev
   )
 
+  # Só quem compila o Ruby precisa da cadeia de build do próprio interpretador.
+  if [[ "$RUBY_INSTALL_METHOD" == "source" ]]; then
+    packages+=(autoconf bison rustc)
+  fi
+
   if [[ "$INSTALL_NODE" == "1" ]]; then
     packages+=(nodejs npm)
   fi
@@ -342,7 +414,55 @@ install_base_packages() {
   ok "Dependências base instaladas."
 }
 
+# /opt/ruby/current é o contrato com o resto do servidor (perfil de shell,
+# unidades systemd, deploys): seja qual for o método, é sempre ele que aponta
+# para o Ruby ativo.
 install_ruby() {
+  if [[ "$RUBY_INSTALL_METHOD" == "package" ]]; then
+    install_ruby_from_package
+  else
+    install_ruby_from_source
+  fi
+
+  link_ruby_executables
+
+  log "Instalando/atualizando Bundler para este Ruby..."
+  gem install bundler --no-document
+
+  ln -sfn /opt/ruby/current/bin/bundle /usr/local/bin/bundle
+  ln -sfn /opt/ruby/current/bin/bundler /usr/local/bin/bundler
+
+  ok "Ruby instalado: $(ruby --version)"
+  ok "Bundler instalado: $(bundle --version)"
+}
+
+# Caminho rápido: o Ruby empacotado pela distribuição, sem compilar nada. O
+# /opt/ruby/system apenas espelha os binários do sistema, para que o layout
+# /opt/ruby/current continue valendo.
+install_ruby_from_package() {
+  local ruby_prefix="/opt/ruby/system"
+
+  log "Instalando Ruby ${RUBY_VERSION} pelo pacote da distribuição..."
+  apt-get install -y ruby-full ruby-dev
+
+  mkdir -p "${ruby_prefix}/bin"
+
+  local executable source_path
+  for executable in ruby gem erb irb rake rdoc ri; do
+    source_path="$(command -v "$executable" 2>/dev/null || true)"
+    [[ -n "$source_path" ]] || continue
+    # Não espelhar o que já é o próprio espelho.
+    [[ "$source_path" == "${ruby_prefix}/bin/${executable}" ]] && continue
+    [[ "$source_path" == "/usr/local/bin/${executable}" ]] && source_path="/usr/bin/${executable}"
+    ln -sfn "$source_path" "${ruby_prefix}/bin/${executable}"
+  done
+
+  ln -sfn "$ruby_prefix" /opt/ruby/current
+
+  ok "Ruby de pacote pronto em ${ruby_prefix} (sem compilação)."
+}
+
+install_ruby_from_source() {
   local ruby_prefix="/opt/ruby/${RUBY_VERSION}"
   local ruby_mm
   ruby_mm="$(awk -F. '{print $1"."$2}' <<<"$RUBY_VERSION")"
@@ -376,8 +496,10 @@ install_ruby() {
   fi
 
   ln -sfn "${ruby_prefix}" /opt/ruby/current
+}
 
-  # Wrappers globais: mantêm um único Ruby ativo para este servidor.
+# Wrappers globais: mantêm um único Ruby ativo para este servidor.
+link_ruby_executables() {
   local executable
   for executable in ruby gem bundle bundler erb irb rake rdoc ri; do
     if [[ -e "/opt/ruby/current/bin/${executable}" ]]; then
@@ -386,16 +508,7 @@ install_ruby() {
   done
 
   export PATH="/opt/ruby/current/bin:/usr/local/bin:${PATH}"
-
-  log "Instalando/atualizando Bundler para este Ruby..."
-  gem install bundler --no-document
-
-  # Recria links depois da instalação do Bundler.
-  ln -sfn /opt/ruby/current/bin/bundle /usr/local/bin/bundle
-  ln -sfn /opt/ruby/current/bin/bundler /usr/local/bin/bundler
-
-  ok "Ruby instalado: $(ruby --version)"
-  ok "Bundler instalado: $(bundle --version)"
+  hash -r
 }
 
 create_app_account() {
@@ -472,34 +585,95 @@ prepare_app_directories() {
   ok "Permissões do diretório da aplicação configuradas."
 }
 
+# O repositório oficial do projeto PostgreSQL (PGDG), que publica a série
+# corrente para Debian/Ubuntu — a distribuição costuma estar uma versão atrás.
+add_pgdg_repository() {
+  local codename
+  codename="${VERSION_CODENAME:-}"
+
+  if [[ -z "$codename" ]]; then
+    warn "Codinome da distribuição não identificado; usando o PostgreSQL da distribuição."
+    return 1
+  fi
+
+  log "Configurando o repositório oficial do PostgreSQL (PGDG)..."
+  install -d -m 0755 /usr/share/keyrings
+
+  if ! curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc |
+      gpg --dearmor --yes --output "$PGDG_KEYRING"; then
+    warn "Não foi possível obter a chave do PGDG."
+    return 1
+  fi
+
+  chmod 0644 "$PGDG_KEYRING"
+  echo "deb [signed-by=${PGDG_KEYRING}] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" > "$PGDG_LIST"
+
+  if ! apt-get update; then
+    warn "Falha ao ler o repositório PGDG para ${codename}."
+    rm -f "$PGDG_LIST"
+    apt-get update || true
+    return 1
+  fi
+
+  return 0
+}
+
+# A porta é descoberta, não presumida: instalar uma série nova ao lado de uma
+# existente coloca o cluster novo em 5433, e o DATABASE_URL tem que apontar
+# para onde o banco realmente está.
+detect_postgres_port() {
+  local port=""
+
+  if command -v pg_lsclusters >/dev/null 2>&1; then
+    port="$(pg_lsclusters --no-header 2>/dev/null | awk -v v="$PG_VERSION" '$1 == v {print $3; exit}')"
+  fi
+
+  printf '%s' "${port:-5432}"
+}
+
 install_postgresql() {
-  log "Instalando PostgreSQL..."
-  apt-get install -y postgresql postgresql-client postgresql-contrib libpq-dev
+  local pg_packages=(postgresql postgresql-client postgresql-contrib libpq-dev)
+
+  if add_pgdg_repository; then
+    if apt-cache show "postgresql-${PG_VERSION}" >/dev/null 2>&1; then
+      pg_packages=("postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}" "postgresql-contrib-${PG_VERSION}" libpq-dev)
+    else
+      warn "PostgreSQL ${PG_VERSION} não está disponível para esta distribuição; usando a versão empacotada."
+    fi
+  fi
+
+  log "Instalando PostgreSQL (${pg_packages[0]})..."
+  apt-get install -y "${pg_packages[@]}"
 
   systemctl enable --now postgresql
 
+  PG_PORT="$(detect_postgres_port)"
+  log "Cluster PostgreSQL respondendo na porta ${PG_PORT}."
+
   log "Configurando usuário e banco PostgreSQL..."
 
-  if ! runuser -u postgres -- psql -tAc \
+  if ! runuser -u postgres -- psql --port="$PG_PORT" -tAc \
       "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" | grep -q 1; then
-    runuser -u postgres -- createuser "$DB_USER"
+    runuser -u postgres -- createuser --port="$PG_PORT" "$DB_USER"
   fi
 
   # psql faz quoting seguro:
   #   :"db_user" = identificador
   #   :'db_pass' = literal SQL
   runuser -u postgres -- psql \
+    --port="$PG_PORT" \
     --set=ON_ERROR_STOP=1 \
     --set=db_user="$DB_USER" \
     --set=db_pass="$DB_PASSWORD" <<'PSQL'
 ALTER ROLE :"db_user" WITH LOGIN PASSWORD :'db_pass';
 PSQL
 
-  if ! runuser -u postgres -- psql -tAc \
+  if ! runuser -u postgres -- psql --port="$PG_PORT" -tAc \
       "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1; then
-    runuser -u postgres -- createdb --owner="$DB_USER" "$DB_NAME"
+    runuser -u postgres -- createdb --port="$PG_PORT" --owner="$DB_USER" "$DB_NAME"
   else
     runuser -u postgres -- psql \
+      --port="$PG_PORT" \
       --set=ON_ERROR_STOP=1 \
       --set=db_name="$DB_NAME" \
       --set=db_user="$DB_USER" <<'PSQL'
@@ -507,7 +681,7 @@ ALTER DATABASE :"db_name" OWNER TO :"db_user";
 PSQL
   fi
 
-  ok "PostgreSQL configurado."
+  ok "PostgreSQL $(runuser -u postgres -- psql --port="$PG_PORT" -tAc "SHOW server_version" | tr -d ' ') configurado na porta ${PG_PORT}."
 }
 
 mysql_escape_literal() {
@@ -591,7 +765,7 @@ create_environment_file() {
     if [[ "$DB_ENGINE" == "postgresql" ]]; then
       local encoded_password
       encoded_password="$(urlencode_with_ruby "$DB_PASSWORD")"
-      echo "DATABASE_URL=postgresql://${DB_USER}:${encoded_password}@127.0.0.1:5432/${DB_NAME}"
+      echo "DATABASE_URL=postgresql://${DB_USER}:${encoded_password}@127.0.0.1:${PG_PORT}/${DB_NAME}"
     elif [[ "$DB_ENGINE" == "mysql" ]]; then
       local encoded_password
       encoded_password="$(urlencode_with_ruby "$DB_PASSWORD")"
@@ -629,8 +803,13 @@ print_final_instructions() {
   echo "Usuário serviço : $APP_USER"
   echo "Grupo           : $APP_GROUP"
   echo "Ruby            : $(ruby --version)"
+  echo "Instalação Ruby : $([[ "$RUBY_INSTALL_METHOD" == "package" ]] && echo "pacote da distribuição (sem compilação)" || echo "compilado do fonte")"
   echo "Bundler         : $(bundle --version)"
-  echo "Banco           : $DB_ENGINE"
+  if [[ "$DB_ENGINE" == "postgresql" ]]; then
+    echo "Banco           : PostgreSQL ${PG_VERSION} (porta ${PG_PORT})"
+  else
+    echo "Banco           : $DB_ENGINE"
+  fi
   echo "EnvironmentFile : $APP_ENV_FILE"
   echo
   echo "Próximos passos sugeridos após copiar/clonar a aplicação:"
@@ -652,7 +831,12 @@ print_final_instructions() {
   echo "  - usuários adicionados agora ao grupo ${APP_GROUP} precisam abrir uma"
   echo "    nova sessão para a nova associação de grupo valer;"
   echo "  - este script não expõe o banco externamente;"
-  echo "  - este script não cria o serviço Puma/systemd nem o proxy Nginx."
+  echo "  - este script não cria o serviço Puma/systemd nem o proxy Nginx;"
+  if [[ "$RUBY_INSTALL_METHOD" == "package" ]]; then
+    echo "  - o Ruby veio empacotado pela distribuição. Se a aplicação exigir uma"
+    echo "    versão de patch específica, rode novamente escolhendo a instalação"
+    echo "    a partir do código-fonte."
+  fi
   echo "============================================================"
 }
 
