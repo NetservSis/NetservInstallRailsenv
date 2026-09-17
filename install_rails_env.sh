@@ -17,7 +17,8 @@ IFS=$'\n\t'
 #   curl -fsSL <URL_DO_SCRIPT> | sudo bash -s -- <nome_aplicacao> <diretorio_aplicacao>
 #
 # Exemplo:
-#   curl -fsSL https://raw.githubusercontent.com/NetservSis/NetservInstallRailsenv/refs/heads/main/install_rails_env.sh #     | sudo bash -s -- netserv-rh /var/www/netserv-rh
+#   curl -fsSL https://raw.githubusercontent.com/NetservSis/NetservInstallRailsenv/refs/heads/main/install_rails_env.sh \
+#     | sudo bash -s -- netserv-rh /var/www/netserv-rh
 #
 # O script:
 #   - instala dependências de compilação do Ruby/Rails;
@@ -36,6 +37,7 @@ IFS=$'\n\t'
 #   migrations automaticamente. Ele apenas prepara o ambiente do servidor.
 # ==============================================================================
 
+SCRIPT_VERSION="1.0.3"
 RUBY_VERSION_DEFAULT="3.4.10"
 RAILS_APPS_CONFIG_ROOT="/etc/rails-apps"
 TTY_DEVICE="/dev/tty"
@@ -165,18 +167,20 @@ prompt_nonempty() {
   local __var_name="$1"
   local prompt="$2"
   local default="${3:-}"
-  local value
+  local __input_value=""
 
   while true; do
+    __input_value=""
+
     if [[ -n "$default" ]]; then
-      read -r -p "${prompt} [${default}]: " value < "$TTY_DEVICE"
-      value="${value:-$default}"
+      read -r -p "${prompt} [${default}]: " __input_value < "$TTY_DEVICE"
+      __input_value="${__input_value:-$default}"
     else
-      read -r -p "${prompt}: " value < "$TTY_DEVICE"
+      read -r -p "${prompt}: " __input_value < "$TTY_DEVICE"
     fi
 
-    if [[ -n "$value" ]]; then
-      printf -v "$__var_name" '%s' "$value"
+    if [[ -n "$__input_value" ]]; then
+      printf -v "$__var_name" '%s' "$__input_value"
       return 0
     fi
 
@@ -188,14 +192,16 @@ prompt_identifier() {
   local __var_name="$1"
   local prompt="$2"
   local default="$3"
-  local value
+  local __identifier_value=""
 
   while true; do
-    prompt_nonempty value "$prompt" "$default"
-    if [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      printf -v "$__var_name" '%s' "$value"
+    prompt_nonempty __identifier_value "$prompt" "$default"
+
+    if [[ "$__identifier_value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      printf -v "$__var_name" '%s' "$__identifier_value"
       return 0
     fi
+
     echo "Use somente letras, números e '_' e não inicie por número."
   done
 }
@@ -226,6 +232,7 @@ collect_options() {
   echo "=============================================="
   echo " Configuração do ambiente Rails"
   echo "=============================================="
+  echo "Versão    : $SCRIPT_VERSION"
   echo "Aplicação : $APP_NAME"
   echo "Diretório : $APP_DIR"
   echo "Usuário   : $APP_USER"
