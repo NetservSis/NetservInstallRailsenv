@@ -7,11 +7,17 @@ IFS=$'\n\t'
 #
 # Prepara um servidor Debian/Ubuntu para receber uma aplicação Ruby on Rails.
 #
-# Uso:
+# Uso local:
 #   sudo ./install_rails_env.sh <nome_aplicacao> <diretorio_aplicacao>
 #
 # Exemplo:
-#   sudo ./install_rails_env.sh model5_support /var/www/model5_support
+#   sudo ./install_rails_env.sh minha_aplicacao /var/www/minha_aplicacao
+#
+# Uso via curl:
+#   curl -fsSL <URL_DO_SCRIPT> | sudo bash -s -- <nome_aplicacao> <diretorio_aplicacao>
+#
+# Exemplo:
+#   curl -fsSL https://raw.githubusercontent.com/NetservSis/NetservInstallRailsenv/refs/heads/main/install_rails_env.sh #     | sudo bash -s -- netserv-rh /var/www/netserv-rh
 #
 # O script:
 #   - instala dependências de compilação do Ruby/Rails;
@@ -47,24 +53,46 @@ trap on_error ERR
 
 usage() {
   cat <<EOF
-Uso:
+Uso com arquivo local:
   sudo $0 <nome_aplicacao> <diretorio_aplicacao>
 
 Exemplo:
-  sudo $0 model5_support /var/www/model5_support
+  sudo $0 minha_aplicacao /var/www/minha_aplicacao
+
+Uso via curl/pipe:
+  curl -fsSL <URL_DO_SCRIPT> | sudo bash -s -- <nome_aplicacao> <diretorio_aplicacao>
+
+Exemplo:
+  curl -fsSL https://raw.githubusercontent.com/NetservSis/NetservInstallRailsenv/refs/heads/main/install_rails_env.sh \
+    | sudo bash -s -- netserv-rh /var/www/netserv-rh
 EOF
 }
 
 require_root() {
-  if [[ ${EUID} -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || die "Execute como root ou instale/use sudo."
-    log "Elevando privilégios com sudo..."
-    exec sudo --preserve-env=TERM bash "$(readlink -f "$0")" "$@"
+  if [[ ${EUID} -eq 0 ]]; then
+    return 0
   fi
+
+  command -v sudo >/dev/null 2>&1 || die "Execute como root ou instale/use sudo."
+
+  # Quando executado por pipe (bash -s), não existe um arquivo local confiável
+  # para relançar automaticamente com sudo. Nesse caso orientamos o comando certo.
+  if [[ "$0" == "bash" || "$0" == "/bin/bash" || "$0" == "-bash" ]]; then
+    die "Ao executar via curl/pipe, use: curl -fsSL <URL> | sudo bash -s -- <nome_aplicacao> <diretorio_aplicacao>"
+  fi
+
+  log "Elevando privilégios com sudo..."
+  exec sudo --preserve-env=TERM bash "$(readlink -f "$0")" "$@"
 }
 
 validate_app_args() {
-  [[ $# -eq 2 ]] || { usage; exit 1; }
+  if [[ $# -ne 2 ]]; then
+    echo
+    warn "São necessários exatamente 2 parâmetros: nome da aplicação e diretório."
+    echo
+    usage
+    exit 1
+  fi
 
   APP_NAME="$1"
   APP_DIR="$(realpath -m "$2")"
