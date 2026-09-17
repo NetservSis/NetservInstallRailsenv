@@ -38,6 +38,7 @@ IFS=$'\n\t'
 
 RUBY_VERSION_DEFAULT="3.4.10"
 RAILS_APPS_CONFIG_ROOT="/etc/rails-apps"
+TTY_DEVICE="/dev/tty"
 
 log()  { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -133,6 +134,11 @@ detect_os() {
   command -v apt-get >/dev/null 2>&1 || die "apt-get não encontrado."
 }
 
+require_interactive_tty() {
+  [[ -r "$TTY_DEVICE" && -w "$TTY_DEVICE" ]] || \
+    die "Este instalador é interativo e precisa de um terminal (/dev/tty). Execute-o diretamente em um shell interativo."
+}
+
 prompt_yes_no() {
   local prompt="$1"
   local default="${2:-N}"
@@ -140,10 +146,10 @@ prompt_yes_no() {
 
   while true; do
     if [[ "$default" == "S" ]]; then
-      read -r -p "$prompt [S/n]: " answer
+      read -r -p "$prompt [S/n]: " answer < "$TTY_DEVICE"
       answer="${answer:-s}"
     else
-      read -r -p "$prompt [s/N]: " answer
+      read -r -p "$prompt [s/N]: " answer < "$TTY_DEVICE"
       answer="${answer:-n}"
     fi
 
@@ -163,10 +169,10 @@ prompt_nonempty() {
 
   while true; do
     if [[ -n "$default" ]]; then
-      read -r -p "${prompt} [${default}]: " value
+      read -r -p "${prompt} [${default}]: " value < "$TTY_DEVICE"
       value="${value:-$default}"
     else
-      read -r -p "${prompt}: " value
+      read -r -p "${prompt}: " value < "$TTY_DEVICE"
     fi
 
     if [[ -n "$value" ]]; then
@@ -200,11 +206,11 @@ prompt_password() {
   local p1 p2
 
   while true; do
-    read -r -s -p "${prompt}: " p1
+    read -r -s -p "${prompt}: " p1 < "$TTY_DEVICE"
     echo
     [[ -n "$p1" ]] || { echo "A senha não pode ser vazia."; continue; }
 
-    read -r -s -p "Confirme a senha: " p2
+    read -r -s -p "Confirme a senha: " p2 < "$TTY_DEVICE"
     echo
 
     [[ "$p1" == "$p2" ]] || { echo "As senhas não conferem."; continue; }
@@ -241,7 +247,7 @@ collect_options() {
   echo
 
   while true; do
-    read -r -p "Escolha [1-3]: " DB_CHOICE
+    read -r -p "Escolha [1-3]: " DB_CHOICE < "$TTY_DEVICE"
     case "$DB_CHOICE" in
       1) DB_ENGINE="postgresql"; break ;;
       2) DB_ENGINE="mysql"; break ;;
@@ -647,6 +653,7 @@ main() {
   require_root "$@"
   validate_app_args "$@"
   detect_os
+  require_interactive_tty
   collect_options
 
   install_base_packages
